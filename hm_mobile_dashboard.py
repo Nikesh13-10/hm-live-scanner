@@ -588,6 +588,38 @@ st.caption(
     f"**BANK NIFTY:** ₹{bnf_spot['spot']:,.2f} ({b_bias})"
 )
 
+PAPER_MODE = "💼 Paper Trading Terminal (Options CE/PE + Spot) + 📊 90-Day Backtester"
+
+def open_signal_in_paper(symbol, signal):
+    """Open the paper terminal with the selected scanner symbol and signal bias."""
+    signal_text = str(signal).upper()
+
+    if "EXIT" in signal_text or "TOP" in signal_text:
+        st.session_state["paper_signal_note"] = (
+            f"{symbol}: {signal}. This is an EXIT / reversal warning, not a fresh entry. "
+            "Review any open position and use the manual Exit control if appropriate."
+        )
+        st.session_state["paper_inst_mode"] = "💵 Spot / Cash Equity"
+    elif "SHORT" in signal_text or "BEARISH" in signal_text:
+        st.session_state["paper_signal_note"] = (
+            f"{symbol}: {signal}. Bearish bias selected. Review the setup; no order has been placed."
+        )
+        st.session_state["paper_inst_mode"] = "⚡ Options Chain (CE / PE)"
+        st.session_state["paper_option_type"] = "PE (Put)"
+        st.session_state["paper_option_side"] = "BUY OPTION"
+    else:
+        st.session_state["paper_signal_note"] = (
+            f"{symbol}: {signal}. Bullish bias selected. Review the setup; no order has been placed."
+        )
+        st.session_state["paper_inst_mode"] = "⚡ Options Chain (CE / PE)"
+        st.session_state["paper_option_type"] = "CE (Call)"
+        st.session_state["paper_option_side"] = "BUY OPTION"
+
+    st.session_state["app_mode"] = PAPER_MODE
+    st.session_state["paper_selected_sym"] = symbol
+    st.session_state["paper_spot_side"] = "BUY (LONG)"
+
+
 mode_choice = st.selectbox(
     "Select App Mode / Strategy",
     [
@@ -596,6 +628,7 @@ mode_choice = st.selectbox(
         "💼 Paper Trading Terminal (Options CE/PE + Spot) + 📊 90-Day Backtester",
     ],
     index=0,
+    key="app_mode",
 )
 
 ist_now = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%d %b %Y, %I:%M:%S %p IST")
@@ -714,11 +747,17 @@ if mode_choice.startswith("💼"):
 
         st.subheader("⚡ Live Options (CE/PE) & Spot Order Ticket (All Indices & 150+ F&O Stocks)")
 
+        if st.session_state.get("paper_signal_note"):
+            st.info(st.session_state["paper_signal_note"])
+            if st.button("Dismiss signal note", key="dismiss_paper_signal_note"):
+                st.session_state.pop("paper_signal_note", None)
+                st.rerun()
+
         top_c1, top_c2, top_c3 = st.columns([1.3, 1.3, 1.0])
         with top_c1:
-            selected_sym = st.selectbox("1. Select Stock or Index", list(WATCHLIST.keys()), index=0)
+            selected_sym = st.selectbox("1. Select Stock or Index", list(WATCHLIST.keys()), index=0, key="paper_selected_sym")
         with top_c2:
-            inst_mode = st.selectbox("2. Instrument Segment", ["⚡ Options Chain (CE / PE)", "💵 Spot / Cash Equity"], index=0)
+            inst_mode = st.selectbox("2. Instrument Segment", ["⚡ Options Chain (CE / PE)", "💵 Spot / Cash Equity"], index=0, key="paper_inst_mode")
         with top_c3:
             risk_pct = st.selectbox("3. Max Risk % of ₹5L", [0.5, 1.0, 1.5, 2.0], index=1)
 
@@ -738,9 +777,9 @@ if mode_choice.startswith("💼"):
                 atm_idx = strike_list.index(atm_strike) if atm_strike in strike_list else len(strike_list) // 2
                 chosen_strike = st.selectbox("Strike Price", strike_list, index=atm_idx)
             with o2:
-                opt_type = st.selectbox("Option Type", ["CE (Call)", "PE (Put)"], index=0)
+                opt_type = st.selectbox("Option Type", ["CE (Call)", "PE (Put)"], index=0, key="paper_option_type")
             with o3:
-                order_side = st.selectbox("Action", ["BUY OPTION", "SELL (WRITE) OPTION"], index=0)
+                order_side = st.selectbox("Action", ["BUY OPTION", "SELL (WRITE) OPTION"], index=0, key="paper_option_side")
 
             clean_opt = "CE" if opt_type.startswith("CE") else "PE"
             opt_ltp, opt_delta = calculate_option_premium(spot_price, chosen_strike, clean_opt, atr_val, dte_days=5.0)
@@ -784,7 +823,7 @@ if mode_choice.startswith("💼"):
             # Spot / Cash Equity Order Ticket
             s1, s2, s3, s4 = st.columns([1.1, 1.0, 1.0, 1.0])
             with s1:
-                order_side = st.selectbox("Order Type", ["BUY (LONG)", "SELL (SHORT)"], index=0)
+                order_side = st.selectbox("Order Type", ["BUY (LONG)", "SELL (SHORT)"], index=0, key="paper_spot_side")
             with s2:
                 default_sl = live_data["smart_long_sl"] if order_side.startswith("BUY") else live_data["smart_short_sl"]
                 stop_loss = st.number_input("Smart Stop-Loss (₹)", value=float(default_sl), step=0.5)
@@ -1028,6 +1067,30 @@ else:
                     hide_index=True
                 )
 
+                st.subheader("Open a Scanner Signal in Paper Trading")
+                st.caption(
+                    "Choose Open in Paper Terminal beside a symbol. The terminal will select "
+                    "the symbol and option direction where relevant. You must review and place "
+                    "any paper order yourself."
+                )
+
+                for row_number, row in df_scan.iterrows():
+                    symbol = str(row["Symbol"])
+                    signal = str(row["Signal"])
+                    signal_col, price_col, action_col = st.columns([2.4, 1.0, 1.5])
+                    with signal_col:
+                        st.write(f"**{symbol}** — {signal}")
+                    with price_col:
+                        st.write(f"₹{float(row['Spot (₹)']):,.2f}")
+                    with action_col:
+                        st.button(
+                            "Open in Paper Terminal",
+                            key=f"open_signal_{row_number}_{symbol}",
+                            use_container_width=True,
+                            on_click=open_signal_in_paper,
+                            args=(symbol, signal),
+                        )
+
                 st.caption(
                     "Data is sourced through Yahoo Finance. "
                     "Prices may be delayed and signals are "
@@ -1036,8 +1099,3 @@ else:
 
         except Exception as e:
             st.error(f"Scanner Error: {e}")
-
-
-            if df_bt_trades is not None and not df_bt_trades.empty:
-                st.write(f"**📜 Historical Trade-by-Trade Log ({len(df_bt_trades)} Trades):**")
-                st.dataframe(df_bt_trades, use_container_width=True, hide_index=True)
