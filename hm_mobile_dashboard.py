@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,7 +8,7 @@ import yfinance as yf
 from datetime import datetime
 import pytz
 
-st.set_page_config(page_title="NSE F&O Screener + Paper Trader + 90d Backtester", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="NSE F&O Screener + Options Paper Trader + 90d Backtester", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
 
 WATCHLIST = {
     "NIFTY 50": "^NSEI", "BANK NIFTY": "^NSEBANK", "FINNIFTY": "NIFTY_FIN_SERVICE.NS",
@@ -94,6 +95,78 @@ def save_portfolio():
 
 load_portfolio()
 
+# ==============================================================================
+# BLACK-SCHOLES OPTION PRICING ENGINE (FOR ALL INDICES & F&O STOCKS)
+# ==============================================================================
+def norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def get_strike_step_and_lot(symbol_name, spot_price):
+    if symbol_name == "NIFTY 50":
+        return 50.0, 75
+    elif symbol_name == "BANK NIFTY":
+        return 100.0, 30
+    elif symbol_name == "FINNIFTY":
+        return 50.0, 65
+    if spot_price <= 0:
+        return 10.0, 500
+    if spot_price < 100:
+        step = 2.5
+    elif spot_price < 250:
+        step = 5.0
+    elif spot_price < 500:
+        step = 10.0
+    elif spot_price < 1000:
+        step = 20.0
+    elif spot_price < 2500:
+        step = 50.0
+    elif spot_price < 5000:
+        step = 100.0
+    else:
+        step = 250.0
+    # Approximate standard NSE F&O contract value (~₹5.5L per lot)
+    lot_size = max(25, int(round((550000.0 / spot_price) / 25.0) * 25))
+    return step, lot_size
+
+def calculate_option_premium(spot, strike, opt_type="CE", atr=0.0, dte_days=5.0, r=0.068):
+    if spot <= 0 or strike <= 0:
+        return 1.0, 0.5
+    T = max(dte_days / 365.0, 1.0 / 365.0)
+    # Estimate annualized Implied Volatility from intraday ATR (bounded 13% to 55%)
+    iv = max(0.13, min(0.55, (atr / spot) * math.sqrt(252.0 * 12.0))) if atr > 0 else 0.18
+    d1 = (math.log(spot / strike) + (r + 0.5 * iv * iv) * T) / (iv * math.sqrt(T))
+    d2 = d1 - iv * math.sqrt(T)
+    if opt_type == "CE":
+        price = spot * norm_cdf(d1) - strike * math.exp(-r * T) * norm_cdf(d2)
+        delta = round(norm_cdf(d1), 2)
+    else:
+        price = strike * math.exp(-r * T) * norm_cdf(-d2) - spot * norm_cdf(-d1)
+        delta = round(norm_cdf(d1) - 1.0, 2)
+    return round(max(price, 0.50), 2), delta
+
+def build_option_chain_table(symbol_name, spot, atr, dte_days=5.0):
+    step, lot_size = get_strike_step_and_lot(symbol_name, spot)
+    atm = round(spot / step) * step if step > 0 else round(spot)
+    strikes = [round(atm + i * step, 2) for i in range(-4, 5)]
+    chain_rows = []
+    for k in strikes:
+        ce_ltp, ce_delta = calculate_option_premium(spot, k, "CE", atr, dte_days)
+        pe_ltp, pe_delta = calculate_option_premium(spot, k, "PE", atr, dte_days)
+        tag = "⭐ ATM" if abs(k - atm) < 0.01 else ("ITM Call / OTM Put" if k < atm else "OTM Call / ITM Put")
+        chain_rows.append({
+            "Strike Zone": tag,
+            "CALL (CE) LTP (₹)": ce_ltp,
+            "CE Delta": ce_delta,
+            "Strike Price": k,
+            "PUT (PE) LTP (₹)": pe_ltp,
+            "PE Delta": pe_delta,
+            "Lot Size": lot_size,
+        })
+    return pd.DataFrame(chain_rows), strikes, atm, lot_size
+
+# ==============================================================================
+# CORE HILEGA-MILEGA & HYBRID MASTER INDICATORS
+# ==============================================================================
 def compute_rsi(series, length=9):
     delta = series.diff()
     gain = delta.clip(lower=0.0)
@@ -191,9 +264,7 @@ def get_live_spot_price(symbol_name):
 
 @st.cache_data(ttl=120)
 def run_90_day_backtest(symbol_name, tf, strat_name, risk_pct, avoid_midday_chop=True):
-    """Simulates 90-day historical trades (or 60d max on 15m) with Smart SL, 1:1.5 Breakeven Trail & 1:3 Target."""
     yf_ticker = WATCHLIST.get(symbol_name, "^NSEI")
-    # Yahoo Finance allows max 60d for 15m, and 90d+ for 1h and 1d
     period_str = "60d" if tf == "15m" else "90d"
     df = yf.download(tickers=yf_ticker, period=period_str, interval=tf, progress=False)
     if df is None or len(df) < 40:
@@ -208,24 +279,19 @@ def run_90_day_backtest(symbol_name, tf, strat_name, risk_pct, avoid_midday_chop
     rsi9 = compute_rsi(close, 9)
     ema3 = rsi9.ewm(span=3, adjust=False).mean()
     wma21 = compute_wma(rsi9, 21)
+    price_ema21 = close.ewm(span=21, adjust=False).mean()
     atr14 = compute_atr_series(df, 14).bfill().fillna(close * 0.005)
     vol_avg20 = vol.rolling(20).mean().bfill()
 
     idx = df.index
-    if idx.tz is not None:
-        ist_idx = idx.tz_convert("Asia/Kolkata")
-    else:
-        ist_idx = idx
+    ist_idx = idx.tz_convert("Asia/Kolkata") if idx.tz is not None else idx
 
-    # Compute daily rolling VWAP & Opening Range High/Low
     dates = pd.Series(ist_idx.date, index=df.index)
     tp = (high + low + close) / 3.0
     tp_vol = tp * vol
     cum_tp_vol = tp_vol.groupby(dates).cumsum()
     cum_vol = vol.groupby(dates).cumsum().replace(0, np.nan)
-    vwap_s = (cum_tp_vol / cum_vol).fillna(close)
-    orb_high_s = high.groupby(dates).transform("first")
-    orb_low_s = low.groupby(dates).transform("first")
+    vwap_s = (cum_tp_vol / cum_vol).fillna(price_ema21)
 
     is_hybrid = "Hybrid" in strat_name
     is_index = symbol_name in ["NIFTY 50", "BANK NIFTY", "FINNIFTY"]
@@ -242,48 +308,59 @@ def run_90_day_backtest(symbol_name, tf, strat_name, risk_pct, avoid_midday_chop
         r_i, r_prev = float(rsi9.iloc[i]), float(rsi9.iloc[i - 1])
         e_i = float(ema3.iloc[i])
         w_i, w_prev = float(wma21.iloc[i]), float(wma21.iloc[i - 1])
+        p_ema21 = float(price_ema21.iloc[i])
         atr_i = float(atr14.iloc[i])
         vwap_i = float(vwap_s.iloc[i])
-        orb_h_i, orb_l_i = float(orb_high_s.iloc[i]), float(orb_low_s.iloc[i])
         v_i, v_avg = float(vol.iloc[i]), float(vol_avg20.iloc[i])
-        rvol_i = (v_i / v_avg) if v_avg > 0 else 1.0
+        rvol_i = (v_i / v_avg) if v_avg > 0 else 1.5
+        spread_i = abs(r_i - w_i)
 
         if np.isnan([r_i, e_i, w_i, c_i]).any():
             continue
 
-        # 1. Manage Open Position if active
         if pos is not None:
             exit_price = None
             exit_reason = None
 
             if pos["Side"] == "LONG":
+                if not pos["T1_Booked"] and h_i >= pos["T1"]:
+                    half_qty = max(1, pos["Qty"] // 2)
+                    pos["Booked_PnL"] = (pos["T1"] - pos["Entry"]) * half_qty
+                    pos["Rem_Qty"] = pos["Qty"] - half_qty
+                    pos["T1_Booked"] = True
+                    pos["SL"] = pos["Entry"]
+
                 if l_i <= pos["SL"]:
                     exit_price = pos["SL"]
-                    exit_reason = "Stop-Loss / Trail SL" if pos["SL"] < pos["Entry"] else "Breakeven Trail SL"
+                    exit_reason = "T1 Booked (50%) + Breakeven Trail" if pos["T1_Booked"] else "Stop-Loss Hit"
                 elif h_i >= pos["T2"]:
                     exit_price = pos["T2"]
-                    exit_reason = "Target 2 (1:3) Hit"
+                    exit_reason = "Target 1 + Target 2 (Full Win)"
                 elif (r_i < w_i) and (r_prev >= w_prev):
                     exit_price = c_i
-                    exit_reason = "HM Top / Reversal Exit"
-                elif h_i >= pos["T1"] and pos["SL"] < pos["Entry"]:
-                    pos["SL"] = pos["Entry"]  # Auto-trail SL to Breakeven
+                    exit_reason = "T1 Booked + HM Top Exit" if pos["T1_Booked"] else "HM Reversal Exit"
             else:
+                if not pos["T1_Booked"] and l_i <= pos["T1"]:
+                    half_qty = max(1, pos["Qty"] // 2)
+                    pos["Booked_PnL"] = (pos["Entry"] - pos["T1"]) * half_qty
+                    pos["Rem_Qty"] = pos["Qty"] - half_qty
+                    pos["T1_Booked"] = True
+                    pos["SL"] = pos["Entry"]
+
                 if h_i >= pos["SL"]:
                     exit_price = pos["SL"]
-                    exit_reason = "Stop-Loss / Trail SL" if pos["SL"] > pos["Entry"] else "Breakeven Trail SL"
+                    exit_reason = "T1 Booked (50%) + Breakeven Trail" if pos["T1_Booked"] else "Stop-Loss Hit"
                 elif l_i <= pos["T2"]:
                     exit_price = pos["T2"]
-                    exit_reason = "Target 2 (1:3) Hit"
+                    exit_reason = "Target 1 + Target 2 (Full Win)"
                 elif (r_i > w_i) and (r_prev <= w_prev):
                     exit_price = c_i
-                    exit_reason = "HM Bottom / Reversal Exit"
-                elif l_i <= pos["T1"] and pos["SL"] > pos["Entry"]:
-                    pos["SL"] = pos["Entry"]  # Auto-trail SL to Breakeven
+                    exit_reason = "T1 Booked + HM Bottom Exit" if pos["T1_Booked"] else "HM Reversal Exit"
 
             if exit_price is not None:
-                pnl = (exit_price - pos["Entry"]) * pos["Qty"] if pos["Side"] == "LONG" else (pos["Entry"] - exit_price) * pos["Qty"]
-                capital += pnl
+                rem_pnl = (exit_price - pos["Entry"]) * pos["Rem_Qty"] if pos["Side"] == "LONG" else (pos["Entry"] - exit_price) * pos["Rem_Qty"]
+                total_trade_pnl = pos["Booked_PnL"] + rem_pnl
+                capital += total_trade_pnl
                 trades.append({
                     "Entry Time": pos["EntryTime"],
                     "Exit Time": t_stamp.strftime("%d-%b %H:%M"),
@@ -293,59 +370,67 @@ def run_90_day_backtest(symbol_name, tf, strat_name, risk_pct, avoid_midday_chop
                     "Entry (₹)": round(pos["Entry"], 2),
                     "Exit (₹)": round(exit_price, 2),
                     "Exit Reason": exit_reason,
-                    "Net P&L (₹)": round(pnl, 2),
+                    "Net P&L (₹)": round(total_trade_pnl, 2),
                     "Balance (₹)": round(capital, 2),
                 })
                 pos = None
 
-        # 2. Check for New Entry Signal if flat
         if pos is None:
             if avoid_midday_chop and tf in ["5m", "15m"]:
                 hr_min = t_stamp.hour * 60 + t_stamp.minute
-                if 690 <= hr_min <= 795:  # 11:30 AM to 1:15 PM IST
+                if 690 <= hr_min <= 795:
                     equity_curve.append({"Time": t_stamp, "Equity (₹)": round(capital, 2)})
                     continue
 
             buy_trig, short_trig = False, False
+            fresh_bull_cross = ((r_i > w_i and r_prev <= w_prev) or (r_i > 55.0 and r_prev <= 55.0 and r_i > w_i)) and (r_i >= e_i) and (spread_i >= 3.0)
+            fresh_bear_cross = ((r_i < w_i and r_prev >= w_prev) or (r_i < 45.0 and r_prev >= 45.0 and r_i < w_i)) and (r_i <= e_i) and (spread_i >= 3.0)
+
             if is_hybrid:
-                vol_ok = (rvol_i >= 1.2) or is_index or (tf == "1d")
-                if (c_i >= vwap_i) and (r_i > 55.0) and (r_i > w_i) and (r_i >= e_i) and ((c_i > orb_h_i and vol_ok) or (c_i > h_prev)):
+                vol_ok = (rvol_i >= 1.15) or is_index or (tf == "1d")
+                if fresh_bull_cross and (c_i >= vwap_i) and (c_i >= p_ema21) and (c_i > h_prev) and vol_ok:
                     buy_trig = True
-                elif (c_i <= vwap_i) and (r_i < 45.0) and (r_i < w_i) and (r_i <= e_i) and ((c_i < orb_l_i and vol_ok) or (c_i < l_prev)):
+                elif fresh_bear_cross and (c_i <= vwap_i) and (c_i <= p_ema21) and (c_i < l_prev) and vol_ok:
                     short_trig = True
             else:
-                if ((r_i > w_i and r_prev <= w_prev) or (r_i > 50.0 and r_prev <= 50.0 and r_i > w_i)) and (r_i >= e_i):
+                if fresh_bull_cross and (c_i > h_prev):
                     buy_trig = True
-                elif ((r_i < w_i and r_prev >= w_prev) or (r_i < 50.0 and r_prev >= 50.0 and r_i < w_i)) and (r_i <= e_i):
+                elif fresh_bear_cross and (c_i < l_prev):
                     short_trig = True
 
             if buy_trig:
-                sl_val = min(l_i, vwap_i if is_hybrid else l_i) - (0.25 * atr_i)
-                risk_sh = max(abs(c_i - sl_val), c_i * 0.003)
+                sl_val = c_i - (1.2 * atr_i)
+                risk_sh = max(abs(c_i - sl_val), c_i * 0.0025)
                 max_loss_rs = capital * (risk_pct / 100.0)
-                qty = max(1, min(int(max_loss_rs // risk_sh), int(capital // c_i)))
+                qty = max(2, min(int(max_loss_rs // risk_sh), int(capital // c_i)))
                 pos = {
                     "EntryTime": t_stamp.strftime("%d-%b %H:%M"),
                     "Side": "LONG",
                     "Qty": qty,
+                    "Rem_Qty": qty,
+                    "Booked_PnL": 0.0,
+                    "T1_Booked": False,
                     "Entry": c_i,
                     "SL": sl_val,
-                    "T1": c_i + (1.5 * risk_sh),
-                    "T2": c_i + (3.0 * risk_sh),
+                    "T1": c_i + (1.2 * risk_sh),
+                    "T2": c_i + (2.5 * risk_sh),
                 }
             elif short_trig:
-                sl_val = max(h_i, vwap_i if is_hybrid else h_i) + (0.25 * atr_i)
-                risk_sh = max(abs(sl_val - c_i), c_i * 0.003)
+                sl_val = c_i + (1.2 * atr_i)
+                risk_sh = max(abs(sl_val - c_i), c_i * 0.0025)
                 max_loss_rs = capital * (risk_pct / 100.0)
-                qty = max(1, min(int(max_loss_rs // risk_sh), int(capital // c_i)))
+                qty = max(2, min(int(max_loss_rs // risk_sh), int(capital // c_i)))
                 pos = {
                     "EntryTime": t_stamp.strftime("%d-%b %H:%M"),
                     "Side": "SHORT",
                     "Qty": qty,
+                    "Rem_Qty": qty,
+                    "Booked_PnL": 0.0,
+                    "T1_Booked": False,
                     "Entry": c_i,
                     "SL": sl_val,
-                    "T1": c_i - (1.5 * risk_sh),
-                    "T2": c_i - (3.0 * risk_sh),
+                    "T1": c_i - (1.2 * risk_sh),
+                    "T2": c_i - (2.5 * risk_sh),
                 }
 
         equity_curve.append({"Time": t_stamp, "Equity (₹)": round(capital, 2)})
@@ -463,21 +548,21 @@ def fetch_and_scan(tf, strat):
             if is_bull_sig:
                 sl = bull_smart_sl
                 risk = max(abs(c_now - sl), 0.5)
-                t1 = round(c_now + (1.5 * risk), 2)
-                t2 = round(c_now + (3.0 * risk), 2)
+                t1 = round(c_now + (1.2 * risk), 2)
+                t2 = round(c_now + (2.5 * risk), 2)
             else:
                 sl = bear_smart_sl
                 risk = max(abs(sl - c_now), 0.5)
-                t1 = round(c_now - (1.5 * risk), 2)
-                t2 = round(c_now - (3.0 * risk), 2)
+                t1 = round(c_now - (1.2 * risk), 2)
+                t2 = round(c_now - (2.5 * risk), 2)
 
             rows.append({
                 "Symbol": name,
                 "Signal": sig,
                 "Spot (₹)": round(c_now, 2),
                 "Smart SL (₹)": sl,
-                "Target 1 (1:1.5)": t1,
-                "Target 2 (1:3)": t2,
+                "Target 1 (50% Book)": t1,
+                "Target 2 (Full)": t2,
                 "VWAP (₹)": vwap_val,
                 "Vol Spike": f"{rvol}x",
                 "RSI (9)": round(r_now, 2),
@@ -492,9 +577,8 @@ def fetch_and_scan(tf, strat):
         df_out = df_out.sort_values(by="Spread", ascending=False).reset_index(drop=True)
     return df_out
 
-st.title("📈 Live NSE F&O Screener, ₹5L Paper Trader & 90d Backtester")
+st.title("📈 Live NSE F&O Screener, Options Paper Trader & 90d Backtester")
 
-# Live Market Regime Top Banner (Nifty 50 & Bank Nifty Filter)
 nifty_spot = get_live_spot_price("NIFTY 50")
 bnf_spot = get_live_spot_price("BANK NIFTY")
 n_bias = "🟢 BULLISH (>VWAP & RSI>50)" if (nifty_spot["spot"] >= nifty_spot["vwap"] and nifty_spot["rsi9"] >= 50) else ("🔴 BEARISH (<VWAP & RSI<50)" if (nifty_spot["spot"] < nifty_spot["vwap"] and nifty_spot["rsi9"] < 50) else "🟡 SIDEWAYS / MIXED")
@@ -509,7 +593,7 @@ mode_choice = st.selectbox(
     [
         "🔥 Hybrid Master Screener (VWAP + 15m ORB + Vol + HM)",
         "📈 Hilega-Milega Screener (Classic RSI 9 / EMA 3 / WMA 21)",
-        "💼 Paper Trading Terminal + 📊 90-Day Strategy Backtester (₹5,00,000 Limit)",
+        "💼 Paper Trading Terminal (Options CE/PE + Spot) + 📊 90-Day Backtester",
     ],
     index=0,
 )
@@ -518,13 +602,10 @@ ist_now = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%d %b %Y, %I:%M:
 
 if mode_choice.startswith("💼"):
     tab_paper, tab_bt = st.tabs([
-        "💼 Live ₹5,00,000 Paper Trading Terminal",
+        "💼 Live ₹5,00,000 Paper Trading Terminal (Options CE/PE & Spot)",
         "📊 90-Day Historical Strategy Backtester (₹5L Simulation)",
     ])
 
-    # ==========================================================================
-    # TAB 1: LIVE ₹5,00,000 PAPER TRADING TERMINAL
-    # ==========================================================================
     with tab_paper:
         port = st.session_state.paper_portfolio
 
@@ -535,72 +616,88 @@ if mode_choice.startswith("💼"):
 
         for pos in port["positions"]:
             spot_info = get_live_spot_price(pos["Symbol"])
-            ltp = spot_info["spot"] if spot_info["spot"] > 0 else pos["EntryPrice"]
+            curr_spot = spot_info["spot"] if spot_info["spot"] > 0 else pos.get("UnderlyingSpot", pos["EntryPrice"])
+            curr_atr = spot_info["atr"] if spot_info["atr"] > 0 else 10.0
+
+            # Evaluate live LTP for Option (CE/PE) or Spot position
+            if pos.get("InstrumentType") == "OPTION":
+                ltp, _ = calculate_option_premium(
+                    curr_spot,
+                    pos["Strike"],
+                    pos["OptionType"],
+                    curr_atr,
+                    pos.get("DTE", 5.0),
+                )
+            else:
+                ltp = curr_spot
+
             qty = pos["Qty"]
             entry = pos["EntryPrice"]
             sl = pos["StopLoss"]
             t1 = pos.get("Target1", pos.get("Target", entry))
             t2 = pos.get("Target2", pos.get("Target", entry))
             side = pos["Side"]
+            contract_label = pos.get("Contract", pos["Symbol"])
 
-            if side == "BUY (LONG)":
+            if side.startswith("BUY"):
                 pnl = (ltp - entry) * qty
                 if ltp <= sl:
                     port["cash"] = round(port["cash"] + pos["Invested"] + pnl, 2)
                     port["realized_pnl"] = round(port["realized_pnl"] + pnl, 2)
                     port["history"].insert(0, {
-                        "ExitTime": ist_now, "Symbol": pos["Symbol"], "Side": f"{side} [SL HIT]",
-                        "Qty": qty, "Entry (₹)": entry, "Exit Spot (₹)": ltp, "Realized P&L (₹)": round(pnl, 2),
+                        "ExitTime": ist_now, "Contract": contract_label, "Side": f"{side} [SL HIT]",
+                        "Qty": qty, "Entry (₹)": entry, "Exit LTP (₹)": ltp, "Realized P&L (₹)": round(pnl, 2),
                     })
-                    auto_events.append(f"🛑 Stop-Loss Hit on {pos['Symbol']} @ ₹{ltp} (P&L: ₹{pnl:+,.2f})")
+                    auto_events.append(f"🛑 Stop-Loss Hit on {contract_label} @ ₹{ltp} (P&L: ₹{pnl:+,.2f})")
                     continue
                 elif ltp >= t2:
                     port["cash"] = round(port["cash"] + pos["Invested"] + pnl, 2)
                     port["realized_pnl"] = round(port["realized_pnl"] + pnl, 2)
                     port["history"].insert(0, {
-                        "ExitTime": ist_now, "Symbol": pos["Symbol"], "Side": f"{side} [TARGET HIT]",
-                        "Qty": qty, "Entry (₹)": entry, "Exit Spot (₹)": ltp, "Realized P&L (₹)": round(pnl, 2),
+                        "ExitTime": ist_now, "Contract": contract_label, "Side": f"{side} [TARGET HIT]",
+                        "Qty": qty, "Entry (₹)": entry, "Exit LTP (₹)": ltp, "Realized P&L (₹)": round(pnl, 2),
                     })
-                    auto_events.append(f"🎯 Target Hit on {pos['Symbol']} @ ₹{ltp} (P&L: ₹{pnl:+,.2f})")
+                    auto_events.append(f"🎯 Target Hit on {contract_label} @ ₹{ltp} (P&L: ₹{pnl:+,.2f})")
                     continue
                 elif ltp >= t1 and sl < entry:
                     pos["StopLoss"] = entry
-                    auto_events.append(f"🛡️ {pos['Symbol']} crossed Target 1! SL auto-trailed to Breakeven (₹{entry}).")
+                    auto_events.append(f"🛡️ {contract_label} crossed Target 1! SL auto-trailed to Breakeven (₹{entry}).")
             else:
                 pnl = (entry - ltp) * qty
                 if ltp >= sl:
                     port["cash"] = round(port["cash"] + pos["Invested"] + pnl, 2)
                     port["realized_pnl"] = round(port["realized_pnl"] + pnl, 2)
                     port["history"].insert(0, {
-                        "ExitTime": ist_now, "Symbol": pos["Symbol"], "Side": f"{side} [SL HIT]",
-                        "Qty": qty, "Entry (₹)": entry, "Exit Spot (₹)": ltp, "Realized P&L (₹)": round(pnl, 2),
+                        "ExitTime": ist_now, "Contract": contract_label, "Side": f"{side} [SL HIT]",
+                        "Qty": qty, "Entry (₹)": entry, "Exit LTP (₹)": ltp, "Realized P&L (₹)": round(pnl, 2),
                     })
-                    auto_events.append(f"🛑 Stop-Loss Hit on {pos['Symbol']} @ ₹{ltp} (P&L: ₹{pnl:+,.2f})")
+                    auto_events.append(f"🛑 Stop-Loss Hit on {contract_label} @ ₹{ltp} (P&L: ₹{pnl:+,.2f})")
                     continue
                 elif ltp <= t2:
                     port["cash"] = round(port["cash"] + pos["Invested"] + pnl, 2)
                     port["realized_pnl"] = round(port["realized_pnl"] + pnl, 2)
                     port["history"].insert(0, {
-                        "ExitTime": ist_now, "Symbol": pos["Symbol"], "Side": f"{side} [TARGET HIT]",
-                        "Qty": qty, "Entry (₹)": entry, "Exit Spot (₹)": ltp, "Realized P&L (₹)": round(pnl, 2),
+                        "ExitTime": ist_now, "Contract": contract_label, "Side": f"{side} [TARGET HIT]",
+                        "Qty": qty, "Entry (₹)": entry, "Exit LTP (₹)": ltp, "Realized P&L (₹)": round(pnl, 2),
                     })
-                    auto_events.append(f"🎯 Target Hit on {pos['Symbol']} @ ₹{ltp} (P&L: ₹{pnl:+,.2f})")
+                    auto_events.append(f"🎯 Target Hit on {contract_label} @ ₹{ltp} (P&L: ₹{pnl:+,.2f})")
                     continue
                 elif ltp <= t1 and sl > entry:
                     pos["StopLoss"] = entry
-                    auto_events.append(f"🛡️ {pos['Symbol']} crossed Target 1! SL auto-trailed to Breakeven (₹{entry}).")
+                    auto_events.append(f"🛡️ {contract_label} crossed Target 1! SL auto-trailed to Breakeven (₹{entry}).")
 
             unrealized_pnl += pnl
             used_margin += pos["Invested"]
             pos_copy = dict(pos)
-            pos_copy["Live Spot (₹)"] = round(ltp, 2)
+            pos_copy["Live LTP (₹)"] = round(ltp, 2)
+            pos_copy["Underlying Spot (₹)"] = round(curr_spot, 2)
             pos_copy["Live P&L (₹)"] = round(pnl, 2)
             pos_copy["P&L %"] = round((pnl / pos["Invested"]) * 100, 2) if pos["Invested"] > 0 else 0.0
             remaining_positions.append(pos_copy)
 
         if auto_events:
             port["positions"] = [
-                {k: v for k, v in p.items() if k not in ["Live Spot (₹)", "Live P&L (₹)", "P&L %"]}
+                {k: v for k, v in p.items() if k not in ["Live LTP (₹)", "Underlying Spot (₹)", "Live P&L (₹)", "P&L %"]}
                 for p in remaining_positions
             ]
             save_portfolio()
@@ -615,56 +712,118 @@ if mode_choice.startswith("💼"):
         m3.metric("📊 Open Positions P&L", f"₹{unrealized_pnl:+,.2f}")
         m4.metric("✅ Realized Profit / Loss", f"₹{port['realized_pnl']:+,.2f}")
 
-        st.subheader("⚡ Smart Order Ticket (With Auto-SL, Auto-Target & 1% Risk Calculator)")
-        c_sym, c_side, c_risk, c_sl, c_t1, c_t2 = st.columns([1.3, 1.0, 1.0, 1.0, 1.0, 1.0])
+        st.subheader("⚡ Live Options (CE/PE) & Spot Order Ticket (All Indices & 150+ F&O Stocks)")
 
-        with c_sym:
-            selected_sym = st.selectbox("Select Stock / Index", list(WATCHLIST.keys()), index=0)
+        top_c1, top_c2, top_c3 = st.columns([1.3, 1.3, 1.0])
+        with top_c1:
+            selected_sym = st.selectbox("1. Select Stock or Index", list(WATCHLIST.keys()), index=0)
+        with top_c2:
+            inst_mode = st.selectbox("2. Instrument Segment", ["⚡ Options Chain (CE / PE)", "💵 Spot / Cash Equity"], index=0)
+        with top_c3:
+            risk_pct = st.selectbox("3. Max Risk % of ₹5L", [0.5, 1.0, 1.5, 2.0], index=1)
 
         live_data = get_live_spot_price(selected_sym)
         spot_price = live_data["spot"]
+        atr_val = live_data["atr"]
 
-        with c_side:
-            order_side = st.selectbox("Order Type", ["BUY (LONG)", "SELL (SHORT)"], index=0)
-        with c_risk:
-            risk_pct = st.selectbox("Max Risk % of ₹5L", [0.5, 1.0, 1.5, 2.0], index=1)
-        with c_sl:
-            default_sl = live_data["smart_long_sl"] if order_side == "BUY (LONG)" else live_data["smart_short_sl"]
-            stop_loss = st.number_input("Smart Stop-Loss (₹)", value=float(default_sl), step=0.5)
+        if inst_mode.startswith("⚡"):
+            # Build live Option Chain for the selected Stock or Index
+            df_chain, strike_list, atm_strike, default_lot = build_option_chain_table(selected_sym, spot_price, atr_val, dte_days=5.0)
 
-        per_share_risk = max(abs(spot_price - stop_loss), 0.5)
-        max_risk_rupees = INITIAL_CAPITAL * (risk_pct / 100.0)
-        recommended_qty = max(1, int(max_risk_rupees // per_share_risk))
-        max_affordable_qty = max(1, int(port["cash"] // spot_price)) if spot_price > 0 else 1
-        safe_default_qty = min(recommended_qty, max_affordable_qty)
+            with st.expander(f"📋 View Live Option Chain for {selected_sym} (Spot: ₹{spot_price:,.2f} | ATM: {atm_strike} | Lot Size: {default_lot})", expanded=True):
+                st.dataframe(df_chain, use_container_width=True, hide_index=True)
 
-        with c_t1:
-            def_t1 = round(spot_price + (1.5 * per_share_risk) if order_side == "BUY (LONG)" else spot_price - (1.5 * per_share_risk), 2)
-            target_1 = st.number_input("Target 1 (1:1.5 Trail)", value=float(def_t1), step=0.5)
-        with c_t2:
-            def_t2 = round(spot_price + (3.0 * per_share_risk) if order_side == "BUY (LONG)" else spot_price - (3.0 * per_share_risk), 2)
-            target_2 = st.number_input("Target 2 (1:3 Exit)", value=float(def_t2), step=0.5)
+            o1, o2, o3, o4, o5, o6 = st.columns([1.1, 1.0, 1.0, 0.9, 1.0, 1.0])
+            with o1:
+                atm_idx = strike_list.index(atm_strike) if atm_strike in strike_list else len(strike_list) // 2
+                chosen_strike = st.selectbox("Strike Price", strike_list, index=atm_idx)
+            with o2:
+                opt_type = st.selectbox("Option Type", ["CE (Call)", "PE (Put)"], index=0)
+            with o3:
+                order_side = st.selectbox("Action", ["BUY OPTION", "SELL (WRITE) OPTION"], index=0)
 
-        order_qty = st.number_input(
-            f"Quantity (Auto-Calculated for {risk_pct}% Risk = ₹{max_risk_rupees:,.0f} Max Loss | Risk/Share: ₹{per_share_risk:.2f})",
-            min_value=1,
-            value=safe_default_qty,
-            step=1,
-        )
-        order_value = round(spot_price * order_qty, 2)
-        actual_max_loss = round(order_qty * per_share_risk, 2)
+            clean_opt = "CE" if opt_type.startswith("CE") else "PE"
+            opt_ltp, opt_delta = calculate_option_premium(spot_price, chosen_strike, clean_opt, atr_val, dte_days=5.0)
+            contract_name = f"{selected_sym} {chosen_strike} {clean_opt}"
 
-        st.info(
-            f"📌 **{selected_sym} Spot:** **₹{spot_price:,.2f}**  |  **VWAP:** ₹{live_data['vwap']:,.2f}  |  "
-            f"**ATR(14):** ₹{live_data['atr']}  |  **RSI(9):** {live_data['rsi9']}  |  "
-            f"**Order Value:** **₹{order_value:,.2f}**  |  **Max Loss if SL Hits:** **₹{actual_max_loss:,.2f}**"
-        )
+            with o4:
+                def_sl_opt = round(opt_ltp * 0.78, 2) if order_side.startswith("BUY") else round(opt_ltp * 1.25, 2)
+                stop_loss = st.number_input("Option SL (₹)", value=float(max(0.5, def_sl_opt)), step=0.5)
 
-        b1, b2, b3 = st.columns([1.3, 1.0, 1.0])
+            per_unit_risk = max(abs(opt_ltp - stop_loss), 0.5)
+            max_risk_rupees = INITIAL_CAPITAL * (risk_pct / 100.0)
+            rec_lots = max(1, int(max_risk_rupees // (per_unit_risk * default_lot)))
+            max_afford_lots = max(1, int(port["cash"] // (opt_ltp * default_lot))) if opt_ltp > 0 else 1
+            safe_lots = min(rec_lots, max_afford_lots)
+
+            with o5:
+                def_t1_opt = round(opt_ltp + (1.2 * per_unit_risk) if order_side.startswith("BUY") else max(0.5, opt_ltp - (1.2 * per_unit_risk)), 2)
+                target_1 = st.number_input("Target 1 (1:1.2)", value=float(def_t1_opt), step=0.5)
+            with o6:
+                def_t2_opt = round(opt_ltp + (2.5 * per_unit_risk) if order_side.startswith("BUY") else max(0.5, opt_ltp - (2.5 * per_unit_risk)), 2)
+                target_2 = st.number_input("Target 2 (1:2.5)", value=float(def_t2_opt), step=0.5)
+
+            lots = st.number_input(
+                f"Number of Lots (1 Lot = {default_lot} Qty | Recommended for {risk_pct}% Risk: {safe_lots} Lots)",
+                min_value=1,
+                value=safe_lots,
+                step=1,
+            )
+            order_qty = int(lots * default_lot)
+            exec_price = opt_ltp
+            order_value = round(exec_price * order_qty, 2)
+            actual_max_loss = round(order_qty * per_unit_risk, 2)
+
+            st.info(
+                f"🎯 **Selected Option:** **{contract_name}**  |  **Option Premium (LTP):** **₹{opt_ltp:,.2f}** (Delta: `{opt_delta}`)  |  "
+                f"**Underlying Spot:** ₹{spot_price:,.2f} (VWAP: ₹{live_data['vwap']:,.2f})  |  "
+                f"**Total Qty:** `{order_qty}` ({lots} Lots)  |  **Premium Required:** **₹{order_value:,.2f}**  |  "
+                f"**Max Risk if SL Hits:** **₹{actual_max_loss:,.2f}**"
+            )
+        else:
+            # Spot / Cash Equity Order Ticket
+            s1, s2, s3, s4 = st.columns([1.1, 1.0, 1.0, 1.0])
+            with s1:
+                order_side = st.selectbox("Order Type", ["BUY (LONG)", "SELL (SHORT)"], index=0)
+            with s2:
+                default_sl = live_data["smart_long_sl"] if order_side.startswith("BUY") else live_data["smart_short_sl"]
+                stop_loss = st.number_input("Smart Stop-Loss (₹)", value=float(default_sl), step=0.5)
+
+            per_unit_risk = max(abs(spot_price - stop_loss), 0.5)
+            max_risk_rupees = INITIAL_CAPITAL * (risk_pct / 100.0)
+            recommended_qty = max(1, int(max_risk_rupees // per_unit_risk))
+            max_affordable_qty = max(1, int(port["cash"] // spot_price)) if spot_price > 0 else 1
+            safe_default_qty = min(recommended_qty, max_affordable_qty)
+
+            with s3:
+                def_t1 = round(spot_price + (1.2 * per_unit_risk) if order_side.startswith("BUY") else spot_price - (1.2 * per_unit_risk), 2)
+                target_1 = st.number_input("Target 1 (1:1.2)", value=float(def_t1), step=0.5)
+            with s4:
+                def_t2 = round(spot_price + (2.5 * per_unit_risk) if order_side.startswith("BUY") else spot_price - (2.5 * per_unit_risk), 2)
+                target_2 = st.number_input("Target 2 (1:2.5)", value=float(def_t2), step=0.5)
+
+            order_qty = st.number_input(
+                f"Quantity (Auto-Calculated for {risk_pct}% Risk = ₹{max_risk_rupees:,.0f} Max Loss)",
+                min_value=1,
+                value=safe_default_qty,
+                step=1,
+            )
+            contract_name = f"{selected_sym} SPOT"
+            exec_price = spot_price
+            order_value = round(exec_price * order_qty, 2)
+            actual_max_loss = round(order_qty * per_unit_risk, 2)
+
+            st.info(
+                f"📌 **{selected_sym} Spot:** **₹{spot_price:,.2f}**  |  **VWAP:** ₹{live_data['vwap']:,.2f}  |  "
+                f"**ATR(14):** ₹{live_data['atr']}  |  **RSI(9):** {live_data['rsi9']}  |  "
+                f"**Order Value:** **₹{order_value:,.2f}**  |  **Max Loss if SL Hits:** **₹{actual_max_loss:,.2f}**"
+            )
+
+        b1, b2, b3 = st.columns([1.4, 1.0, 1.0])
         with b1:
-            place_btn = st.button(f"🚀 Place {order_side} ({order_qty} Qty @ ₹{spot_price})", type="primary", use_container_width=True)
+            place_btn = st.button(f"🚀 Place {order_side} ({contract_name} @ ₹{exec_price})", type="primary", use_container_width=True)
         with b2:
-            refresh_spot = st.button("🔄 Refresh Spot & Check SL/Targets", use_container_width=True)
+            refresh_spot = st.button("🔄 Refresh Option & Spot Prices", use_container_width=True)
         with b3:
             reset_btn = st.button("🗑️ Reset Account to ₹5,00,000", use_container_width=True)
 
@@ -684,37 +843,46 @@ if mode_choice.startswith("💼"):
             st.rerun()
 
         if place_btn:
-            if spot_price <= 0:
-                st.error("Unable to fetch live spot price right now. Please tap Refresh.")
+            if exec_price <= 0:
+                st.error("Unable to fetch live price right now. Please tap Refresh.")
             elif order_value > port["cash"]:
                 st.error(f"Insufficient limit! Order needs ₹{order_value:,.2f}, available cash is ₹{port['cash']:,.2f}.")
             else:
                 port["cash"] = round(port["cash"] - order_value, 2)
-                port["positions"].append({
+                new_pos = {
                     "Time": ist_now,
                     "Symbol": selected_sym,
+                    "Contract": contract_name,
+                    "InstrumentType": "OPTION" if inst_mode.startswith("⚡") else "SPOT",
                     "Side": order_side,
                     "Qty": int(order_qty),
-                    "EntryPrice": spot_price,
+                    "EntryPrice": exec_price,
+                    "UnderlyingSpot": spot_price,
                     "StopLoss": stop_loss,
                     "Target1": target_1,
                     "Target2": target_2,
                     "Invested": order_value,
-                })
+                }
+                if inst_mode.startswith("⚡"):
+                    new_pos["Strike"] = chosen_strike
+                    new_pos["OptionType"] = clean_opt
+                    new_pos["DTE"] = 5.0
+                port["positions"].append(new_pos)
                 save_portfolio()
-                st.success(f"Placed {order_side}: {order_qty} x {selected_sym} @ ₹{spot_price:,.2f} | Smart SL: ₹{stop_loss} | T1: ₹{target_1} | T2: ₹{target_2}")
+                st.success(f"Placed {order_side}: {order_qty} Qty of {contract_name} @ ₹{exec_price:,.2f} | SL: ₹{stop_loss} | T1: ₹{target_1} | T2: ₹{target_2}")
                 st.rerun()
 
         st.subheader(f"📂 Open Paper Positions ({len(remaining_positions)})")
         if remaining_positions:
             st.dataframe(pd.DataFrame(remaining_positions), use_container_width=True, hide_index=True)
-            st.write("**Manual 1-Click Square-Off at Live Spot Price:**")
+            st.write("**Manual 1-Click Square-Off at Live Option/Spot Price:**")
             exit_cols = st.columns(min(4, len(remaining_positions)))
             for idx, pos in enumerate(remaining_positions):
                 col_slot = exit_cols[idx % len(exit_cols)]
+                label_name = pos.get("Contract", pos["Symbol"])
                 with col_slot:
                     if st.button(
-                        f"❌ Exit {pos['Symbol']} ({pos['Side'][:4]}) | P&L: ₹{pos['Live P&L (₹)']:+,.2f}",
+                        f"❌ Exit {label_name} | P&L: ₹{pos['Live P&L (₹)']:+,.2f}",
                         key=f"exit_{idx}",
                         use_container_width=True,
                     ):
@@ -723,32 +891,29 @@ if mode_choice.startswith("💼"):
                         port["realized_pnl"] = round(port["realized_pnl"] + pos["Live P&L (₹)"], 2)
                         port["history"].insert(0, {
                             "ExitTime": ist_now,
-                            "Symbol": orig["Symbol"],
+                            "Contract": orig.get("Contract", orig["Symbol"]),
                             "Side": f"{orig['Side']} [MANUAL EXIT]",
                             "Qty": orig["Qty"],
                             "Entry (₹)": orig["EntryPrice"],
-                            "Exit Spot (₹)": pos["Live Spot (₹)"],
+                            "Exit LTP (₹)": pos["Live LTP (₹)"],
                             "Realized P&L (₹)": pos["Live P&L (₹)"],
                         })
                         save_portfolio()
                         st.rerun()
         else:
-            st.caption("No open paper trades yet. Select any stock or index above to place a virtual trade!")
+            st.caption("No open paper trades yet. Select any Option (CE/PE) or Spot stock above to place a virtual trade!")
 
         if port["history"]:
             st.subheader(f"📜 Closed Trade Book ({len(port['history'])} Trades)")
             st.dataframe(pd.DataFrame(port["history"]), use_container_width=True, hide_index=True)
 
-    # ==========================================================================
-    # TAB 2: 90-DAY HISTORICAL STRATEGY BACKTESTER (₹5,00,000 SIMULATION)
-    # ==========================================================================
     with tab_bt:
         st.subheader("📊 90-Day Strategy Backtester (₹5,00,000 Starting Capital)")
-        st.caption("Simulates historical trades with Smart ATR+VWAP Stop-Loss, Auto-Breakeven Trail at Target 1 (1:1.5), and Full Exit at Target 2 (1:3) or HM Reversal.")
+        st.caption("Enters ONLY on fresh crossovers (Spread >= 3.0), books 50% profit at Target 1 (1:1.2), and trails remaining 50% SL to Breakeven for Target 2 (1:2.5).")
 
         b_c1, b_c2, b_c3, b_c4, b_c5 = st.columns([1.3, 1.5, 0.9, 0.9, 1.1])
         with b_c1:
-            bt_sym = st.selectbox("Backtest Symbol", list(WATCHLIST.keys()), index=0, key="bt_sym")
+            bt_sym = st.selectbox("Backtest Symbol", list(WATCHLIST.keys()), index=3, key="bt_sym")
         with b_c2:
             bt_strat = st.selectbox(
                 "Strategy to Test",
@@ -757,7 +922,7 @@ if mode_choice.startswith("💼"):
                 key="bt_strat",
             )
         with b_c3:
-            bt_tf = st.selectbox("Timeframe", ["1h", "1d", "15m"], index=0, key="bt_tf")
+            bt_tf = st.selectbox("Timeframe", ["1h", "15m", "1d"], index=0, key="bt_tf")
         with b_c4:
             bt_risk = st.selectbox("Risk / Trade (%)", [0.5, 1.0, 1.5, 2.0], index=1, key="bt_risk")
         with b_c5:
@@ -784,48 +949,4 @@ if mode_choice.startswith("💼"):
 
             if df_bt_trades is not None and not df_bt_trades.empty:
                 st.write(f"**📜 Historical Trade-by-Trade Log ({len(df_bt_trades)} Trades):**")
-                st.dataframe(df_bt_trades, use_container_width=True, hide_index=True)
-            else:
-                st.info("No crossover trades triggered for this symbol/timeframe combination.")
-        else:
-            st.warning("Could not load historical backtest data for this symbol.")
-
-else:
-    col1, col2, col3 = st.columns([1, 1.5, 1])
-    with col1:
-        timeframe = st.selectbox("Timeframe", ["15m", "5m", "1h", "1d"], index=0)
-    with col2:
-        filter_mode = st.selectbox(
-            "Filter Signals",
-            [
-                "All Triggered Signals Only",
-                "Bullish Signals Only (Buy)",
-                "Bearish Signals Only (Short / Exit)",
-                "Show Full F&O Watchlist Status",
-            ],
-            index=0,
-        )
-    with col3:
-        st.write("")
-        scan_btn = st.button("🔄 Run Live Scan Now", use_container_width=True, type="primary")
-
-    if scan_btn:
-        st.cache_data.clear()
-
-    with st.spinner(f"Running {mode_choice} on {timeframe}..."):
-        df_results = fetch_and_scan(timeframe, mode_choice)
-
-    if not df_results.empty:
-        if filter_mode == "All Triggered Signals Only":
-            df_view = df_results[~df_results["Signal"].str.startswith("⚪")]
-        elif filter_mode == "Bullish Signals Only (Buy)":
-            df_view = df_results[df_results["Signal"].str.contains("BUY")]
-        elif filter_mode == "Bearish Signals Only (Short / Exit)":
-            df_view = df_results[df_results["Signal"].str.contains("TOP|SHORT|EXIT")]
-        else:
-            df_view = df_results
-
-        st.subheader(f"Live Results ({len(df_view)} Matches, Sorted by Highest Spread) — {ist_now}")
-        st.dataframe(df_view, use_container_width=True, hide_index=True)
-    else:
-        st.info("No data returned. Please click 'Run Live Scan Now'.")
+                st.dataframe(df_bt_trades,
