@@ -949,4 +949,4 @@ if mode_choice.startswith("💼"):
 
             if df_bt_trades is not None and not df_bt_trades.empty:
                 st.write(f"**📜 Historical Trade-by-Trade Log ({len(df_bt_trades)} Trades):**")
-                st.dataframe(df_bt_trades,
+                st.dataframe(df_bt_trades, use_container_width=True, hide_index=True)
