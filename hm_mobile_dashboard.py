@@ -946,6 +946,97 @@ if mode_choice.startswith("💼"):
             if df_bt_eq is not None and not df_bt_eq.empty:
                 st.write("**📈 90-Day Portfolio Equity Curve (₹):**")
                 st.line_chart(df_bt_eq.set_index("Time")["Equity (₹)"])
+                
+else:
+    # ==========================================================
+    # HYBRID MASTER & CLASSIC HILEGA-MILEGA SCREENER
+    # ==========================================================
+
+    is_hybrid_mode = mode_choice.startswith("🔥")
+
+    if is_hybrid_mode:
+        st.subheader("🔥 Hybrid Master Screener")
+        st.caption(
+            "VWAP + 15m ORB + Volume + RSI 9 + EMA 3 + WMA 21"
+        )
+    else:
+        st.subheader("📈 Hilega-Milega Classic Screener")
+        st.caption(
+            "RSI 9 + EMA 3 + WMA 21 crossover strategy"
+        )
+
+    # Timeframe and refresh controls
+    c1, c2 = st.columns([2, 1])
+
+    with c1:
+        scan_tf = st.selectbox(
+            "Select Timeframe",
+            ["5m", "15m", "1h", "1d"],
+            index=1,
+            key="screener_timeframe"
+        )
+
+    with c2:
+        st.write("")
+        refresh_scan = st.button(
+            "🔄 Refresh Scanner",
+            use_container_width=True
+        )
+
+    if refresh_scan:
+        st.cache_data.clear()
+        st.rerun()
+
+    # Run stock scanner
+    with st.spinner("Scanning NSE stocks... Please wait"):
+        try:
+            df_scan = fetch_and_scan(scan_tf, mode_choice)
+
+            if df_scan is None or df_scan.empty:
+                st.warning(
+                    "No signals or market data available. "
+                    "Try refreshing or changing timeframe."
+                )
+            else:
+                # Signal statistics
+                buy_count = df_scan["Signal"].str.contains(
+                    "BUY", case=False, na=False
+                ).sum()
+
+                short_count = df_scan["Signal"].str.contains(
+                    "SHORT", case=False, na=False
+                ).sum()
+
+                exit_count = df_scan["Signal"].str.contains(
+                    "EXIT|TOP", case=False, na=False
+                ).sum()
+
+                m1, m2, m3, m4 = st.columns(4)
+
+                m1.metric("Stocks Scanned", len(df_scan))
+                m2.metric("Buy Signals", int(buy_count))
+                m3.metric("Short Signals", int(short_count))
+                m4.metric("Exit Signals", int(exit_count))
+
+                st.divider()
+
+                st.subheader("📊 NSE Stock Scanner Results")
+
+                st.dataframe(
+                    df_scan,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                st.caption(
+                    "Data is sourced through Yahoo Finance. "
+                    "Prices may be delayed and signals are "
+                    "for educational and paper-trading purposes."
+                )
+
+        except Exception as e:
+            st.error(f"Scanner Error: {e}")
+
 
             if df_bt_trades is not None and not df_bt_trades.empty:
                 st.write(f"**📜 Historical Trade-by-Trade Log ({len(df_bt_trades)} Trades):**")
