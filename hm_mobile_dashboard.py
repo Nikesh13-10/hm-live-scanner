@@ -7,7 +7,7 @@ from datetime import datetime
 import pytz
 
 st.set_page_config(
-    page_title="Long-Term Investment Screener & 5Y Backtester",
+    page_title="Long-Term Investment Screener, Analyzer & 5Y Backtester",
     page_icon="💎",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -130,6 +130,65 @@ def classify_investment_bucket(name, fund, disc_pct):
     return "👀 Watchlist"
 
 
+def get_hm_signal_for_series(df, tf="1wk"):
+    if df is None or len(df) < 25:
+        return None
+    close = df["Close"].squeeze()
+    high = df["High"].squeeze()
+    low = df["Low"].squeeze()
+
+    rsi9 = compute_rsi(close, 9)
+    ema3 = rsi9.ewm(span=3, adjust=False).mean()
+    wma21 = compute_wma(rsi9, 21)
+
+    r_now, r_prev = float(rsi9.iloc[-1]), float(rsi9.iloc[-2])
+    e_now = float(ema3.iloc[-1])
+    w_now, w_prev = float(wma21.iloc[-1]), float(wma21.iloc[-2])
+    c_now = float(close.iloc[-1])
+    l_now = float(low.iloc[-1])
+
+    if np.isnan([r_now, e_now, w_now, c_now]).any():
+        return None
+
+    lookback_52w = 52 if tf == "1wk" else 12
+    high_52w = float(high.tail(lookback_52w).max())
+    low_52w = float(low.tail(lookback_52w).min())
+    disc_pct = round(((high_52w - c_now) / high_52w) * 100.0, 1) if high_52w > 0 else 0.0
+
+    ma_len = 40 if tf == "1wk" else 10
+    ma_series = close.rolling(ma_len).mean()
+    ma_val = float(ma_series.iloc[-1]) if not np.isnan(ma_series.iloc[-1]) else float(close.mean())
+    above_200dma = c_now >= ma_val
+
+    fresh_bottom = (r_now > w_now) and (r_prev <= w_prev) and (r_now >= e_now)
+    if fresh_bottom or ((r_now > w_now) and (r_now >= e_now) and (disc_pct >= 12.0)):
+        sig = "🟢 BOTTOM ACCUMULATE (Buy on Dip)"
+    elif (r_now > 50.0) and (r_now > w_now) and above_200dma:
+        sig = "🚀 CORE UPTREND (SIP / Hold)"
+    elif (r_now < w_now) and (r_prev >= w_prev):
+        sig = "🟠 TOP WARNING / REBALANCE"
+    elif (r_now < 50.0) and (r_now < w_now):
+        sig = "🔴 WEAK / WAIT FOR BOTTOM"
+    else:
+        sig = "⚪ NEUTRAL / WATCH"
+
+    return {
+        "signal": sig,
+        "close": round(c_now, 2),
+        "low": round(l_now, 2),
+        "high_52w": round(high_52w, 2),
+        "low_52w": round(low_52w, 2),
+        "disc_pct": disc_pct,
+        "ma_val": round(ma_val, 2),
+        "above_200dma": above_200dma,
+        "rsi9": round(r_now, 1),
+        "ema3": round(e_now, 1),
+        "wma21": round(w_now, 1),
+        "ma_series": ma_series,
+        "close_series": close,
+    }
+
+
 # ==============================================================================
 # 4. MAIN INVESTMENT SCANNER ENGINE
 # ==============================================================================
@@ -153,63 +212,26 @@ def run_investment_scan(tf, symbol_dict):
     for yf_ticker, name in symbol_map.items():
         try:
             df = data[yf_ticker].dropna() if len(tickers) > 1 else data.dropna()
-            if len(df) < 25:
+            hm = get_hm_signal_for_series(df, tf)
+            if hm is None:
                 continue
-
-            close = df["Close"].squeeze()
-            high = df["High"].squeeze()
-            low = df["Low"].squeeze()
-
-            rsi9 = compute_rsi(close, 9)
-            ema3 = rsi9.ewm(span=3, adjust=False).mean()
-            wma21 = compute_wma(rsi9, 21)
-
-            r_now, r_prev = float(rsi9.iloc[-1]), float(rsi9.iloc[-2])
-            e_now = float(ema3.iloc[-1])
-            w_now, w_prev = float(wma21.iloc[-1]), float(wma21.iloc[-2])
-            c_now = float(close.iloc[-1])
-            l_now = float(low.iloc[-1])
-
-            if np.isnan([r_now, e_now, w_now, c_now]).any():
-                continue
-
-            lookback_52w = 52 if tf == "1wk" else 12
-            high_52w = float(high.tail(lookback_52w).max())
-            disc_pct = round(((high_52w - c_now) / high_52w) * 100.0, 1) if high_52w > 0 else 0.0
-
-            ma_len = 40 if tf == "1wk" else 10
-            ma_val = float(close.rolling(ma_len).mean().iloc[-1]) if len(close) >= ma_len else float(close.mean())
-            above_200dma = c_now >= ma_val
-            dma_status = "Above 200 DMA" if above_200dma else "Below 200 DMA"
-
-            fresh_bottom = (r_now > w_now) and (r_prev <= w_prev) and (r_now >= e_now)
-            if fresh_bottom or ((r_now > w_now) and (r_now >= e_now) and (disc_pct >= 12.0)):
-                sig = "🟢 BOTTOM ACCUMULATE (Buy on Dip)"
-            elif (r_now > 50.0) and (r_now > w_now) and above_200dma:
-                sig = "🚀 CORE UPTREND (SIP / Hold)"
-            elif (r_now < w_now) and (r_prev >= w_prev):
-                sig = "🟠 TOP WARNING / REBALANCE"
-            elif (r_now < 50.0) and (r_now < w_now):
-                sig = "🔴 WEAK / WAIT FOR BOTTOM"
-            else:
-                sig = "⚪ NEUTRAL / WATCH"
 
             fund = fundamentals.get(name, {})
-            bucket = classify_investment_bucket(name, fund, disc_pct)
+            bucket = classify_investment_bucket(name, fund, hm["disc_pct"])
 
             rows.append({
                 "Symbol": name,
                 "Category": bucket,
-                "Investment Signal": sig,
-                "Price (₹)": round(c_now, 2),
-                "52W High Disc %": disc_pct,
-                "200 DMA": dma_status,
+                "Investment Signal": hm["signal"],
+                "Price (₹)": hm["close"],
+                "52W High Disc %": hm["disc_pct"],
+                "200 DMA": "Above 200 DMA" if hm["above_200dma"] else "Below 200 DMA",
                 "P/E": fund.get("pe"),
                 "ROE %": fund.get("roe"),
                 "EPS Growth %": fund.get("eps_g"),
-                "RSI (9)": round(r_now, 1),
-                "WMA (21)": round(w_now, 1),
-                "Support (Low ₹)": round(l_now, 2),
+                "RSI (9)": hm["rsi9"],
+                "WMA (21)": hm["wma21"],
+                "Support (Low ₹)": hm["low"],
             })
         except Exception:
             continue
@@ -229,11 +251,74 @@ def run_investment_scan(tf, symbol_dict):
 
 
 # ==============================================================================
-# 5. 3Y–5Y LONG-ONLY INVESTMENT BACKTESTER (HM STRATEGY VS BUY & HOLD)
+# 5. SINGLE STOCK DEEP INVESTMENT ANALYZER (ANY NSE STOCK)
+# ==============================================================================
+@st.cache_data(ttl=600)
+def analyze_single_stock(raw_symbol):
+    clean_sym = raw_symbol.strip().upper().replace(".NS", "").replace(".BO", "")
+    yf_ticker = f"{clean_sym}.NS"
+
+    df_wk = yf.download(tickers=yf_ticker, period="5y", interval="1wk", progress=False)
+    df_mo = yf.download(tickers=yf_ticker, period="5y", interval="1mo", progress=False)
+
+    if df_wk is None or df_wk.empty or len(df_wk) < 25:
+        return None
+
+    hm_wk = get_hm_signal_for_series(df_wk.dropna(), "1wk")
+    hm_mo = get_hm_signal_for_series(df_mo.dropna(), "1mo") if (df_mo is not None and len(df_mo) >= 25) else None
+
+    if hm_wk is None:
+        return None
+
+    info = {}
+    try:
+        info = yf.Ticker(yf_ticker).info or {}
+    except Exception:
+        info = {}
+
+    pe = info.get("trailingPE") or info.get("forwardPE")
+    roe = info.get("returnOnEquity")
+    eps_g = info.get("earningsGrowth") or info.get("revenueGrowth")
+    dte = info.get("debtToEquity")
+    mcap = info.get("marketCap")
+    div_y = info.get("dividendYield")
+
+    fund = {
+        "name": info.get("longName") or info.get("shortName") or clean_sym,
+        "sector": info.get("sector") or "N/A",
+        "industry": info.get("industry") or "N/A",
+        "pe": round(float(pe), 1) if pe is not None else None,
+        "roe": round(float(roe) * 100, 1) if roe is not None else None,
+        "eps_g": round(float(eps_g) * 100, 1) if eps_g is not None else None,
+        "dte": round(float(dte) / 100.0, 2) if dte is not None else None,
+        "mcap_cr": round(float(mcap) / 1e7, 0) if mcap is not None else None,
+        "div_yield": round(float(div_y) * 100, 2) if div_y is not None else None,
+    }
+
+    bucket = classify_investment_bucket(clean_sym, fund, hm_wk["disc_pct"])
+
+    # Chart DataFrame (5-Year Weekly Price vs 200 DMA Proxy)
+    chart_df = pd.DataFrame({
+        "Price (₹)": hm_wk["close_series"],
+        "200 DMA Proxy (40W SMA)": hm_wk["ma_series"],
+    }).dropna()
+
+    return {
+        "symbol": clean_sym,
+        "yf_ticker": yf_ticker,
+        "bucket": bucket,
+        "fund": fund,
+        "hm_wk": hm_wk,
+        "hm_mo": hm_mo,
+        "chart_df": chart_df,
+    }
+
+
+# ==============================================================================
+# 6. 3Y–5Y LONG-ONLY INVESTMENT BACKTESTER (HM STRATEGY VS BUY & HOLD)
 # ==============================================================================
 @st.cache_data(ttl=600)
 def run_investment_backtest(yf_ticker, symbol_name, tf="1wk", years=5, initial_capital=500000.0, use_200dma_filter=True):
-    # Fetch extra warmup period so RSI(9) & WMA(21) & 40-week MA are ready at start
     fetch_years = years + 2
     df = yf.download(tickers=yf_ticker, period=f"{fetch_years}y", interval=tf, progress=False)
     if df is None or len(df) < 35:
@@ -241,8 +326,6 @@ def run_investment_backtest(yf_ticker, symbol_name, tf="1wk", years=5, initial_c
 
     df = df.dropna().copy()
     close = df["Close"].squeeze()
-    high = df["High"].squeeze()
-    low = df["Low"].squeeze()
 
     rsi9 = compute_rsi(close, 9)
     ema3 = rsi9.ewm(span=3, adjust=False).mean()
@@ -250,7 +333,6 @@ def run_investment_backtest(yf_ticker, symbol_name, tf="1wk", years=5, initial_c
     ma_len = 40 if tf == "1wk" else 10
     ma_long = close.rolling(ma_len).mean()
 
-    # Determine start index corresponding to requested years
     bars_needed = years * (52 if tf == "1wk" else 12)
     start_idx = max(30, len(df) - bars_needed)
     if start_idx >= len(df) - 5:
@@ -277,11 +359,8 @@ def run_investment_backtest(yf_ticker, symbol_name, tf="1wk", years=5, initial_c
         if np.isnan([r_i, e_i, w_i, c_i]).any():
             continue
 
-        # Long-Only Entry: HM Bottom Cross (RSI9 > WMA21) or Bullish Breakout (>50 & RSI9 > WMA21)
         dma_ok = (c_i >= ma_i) if use_200dma_filter else True
         buy_signal = ((r_i > w_i and r_prev <= w_prev) or (r_i > 50.0 and r_prev <= 50.0 and r_i > w_i)) and (r_i >= e_i) and dma_ok
-
-        # Long-Only Exit: HM Top Cross (RSI9 crosses below WMA21)
         exit_signal = (r_i < w_i) and (r_prev >= w_prev)
 
         if shares == 0.0 and buy_signal:
@@ -313,7 +392,6 @@ def run_investment_backtest(yf_ticker, symbol_name, tf="1wk", years=5, initial_c
             "Buy & Hold (₹)": round(bh_val, 2),
         })
 
-    # If still holding at the end of backtest, log open unrealized position
     last_price = float(close.iloc[-1])
     if shares > 0.0:
         curr_val = shares * last_price
@@ -343,7 +421,6 @@ def run_investment_backtest(yf_ticker, symbol_name, tf="1wk", years=5, initial_c
     bh_total_ret = ((bh_final - initial_capital) / initial_capital) * 100.0
     bh_cagr = (((bh_final / initial_capital) ** (1.0 / actual_years)) - 1.0) * 100.0 if bh_final > 0 else 0.0
 
-    # Max Drawdown comparison
     hm_dd = (((df_eq["HM Strategy (₹)"] - df_eq["HM Strategy (₹)"].cummax()) / df_eq["HM Strategy (₹)"].cummax()) * 100.0).min() if not df_eq.empty else 0.0
     bh_dd = (((df_eq["Buy & Hold (₹)"] - df_eq["Buy & Hold (₹)"].cummax()) / df_eq["Buy & Hold (₹)"].cummax()) * 100.0).min() if not df_eq.empty else 0.0
 
@@ -365,17 +442,17 @@ def run_investment_backtest(yf_ticker, symbol_name, tf="1wk", years=5, initial_c
 
 
 # ==============================================================================
-# 6. UI LAYOUT (2 TABS: SCREENER + 3Y–5Y INVESTMENT BACKTESTER)
+# 7. UI LAYOUT (3 TABS: SCREENER + SINGLE STOCK ANALYZER + 3Y–5Y BACKTESTER)
 # ==============================================================================
-st.title("💎 Long-Term Investment Screener & Backtester")
+st.title("💎 Long-Term Investment Screener, Stock Analyzer & Backtester")
 st.caption("Weekly & Monthly Hilega-Milega + **Multibagger vs Compounder** Fundamental Filter (Long-Only)")
 
-tab_scan, tab_bt = st.tabs([
+tab_scan, tab_single, tab_bt = st.tabs([
     "🔍 Investment Screener (Multibagger & Compounder)",
+    "🔎 Single Stock Analyzer (कोणताही स्टॉक तपासा)",
     "📊 3Y–5Y Investment Backtester (HM vs Buy & Hold)",
 ])
 
-# Custom Stock Input shared across both tabs
 with tab_scan:
     custom_input = st.text_input(
         "🔍 Custom Stocks जोडा (उदा. NK Stocktalk मधील कोणताही स्टॉक — कॉमा देऊन NSE Symbol लिहा):",
@@ -457,6 +534,78 @@ with tab_scan:
     else:
         st.info("डेटा लोड झाला नाही. कृपया 'Refresh Scan' वर क्लिक करा.")
 
+# ==============================================================================
+# TAB 2: SINGLE STOCK INVESTMENT ANALYZER
+# ==============================================================================
+with tab_single:
+    st.subheader("🔎 Single Stock Investment Analyzer (कोणताही NSE स्टॉक तपासा)")
+    st.caption("कोणत्याही NSE स्टॉकचे Symbol टाका — त्याचा Multibagger/Compounder दर्जा, Fundamentals आणि Weekly + Monthly Hilega-Milega रिपोर्ट एका क्लिकवर पहा.")
+
+    sc1, sc2 = st.columns([2.2, 1.0])
+    with sc1:
+        query_sym = st.text_input(
+            "NSE Stock Symbol टाका (उदा. TRENT, KPITTECH, JIOFIN, NESTLEIND, TATAMOTORS, IRFC):",
+            value="TRENT",
+            key="single_stock_input",
+        )
+    with sc2:
+        st.write("")
+        analyze_btn = st.button("🔎 Analyze Stock", use_container_width=True, type="primary")
+
+    if query_sym.strip():
+        with st.spinner(f"Analyzing {query_sym.strip().upper()}..."):
+            report = analyze_single_stock(query_sym)
+
+        if report is None:
+            st.error(f"'{query_sym.strip().upper()}' साठी डेटा सापडला नाही. कृपया अचूक NSE Symbol टाका (उदा. RELIANCE, TCS, TRENT, JIOFIN).")
+        else:
+            f = report["fund"]
+            wk = report["hm_wk"]
+            mo = report["hm_mo"]
+
+            st.markdown(f"### {f['name']} (`{report['symbol']}`) — {report['bucket']}")
+            st.caption(f"Sector: **{f['sector']}**  |  Industry: **{f['industry']}**")
+
+            # Top Price & Trend Metrics
+            p1, p2, p3, p4, p5 = st.columns(5)
+            p1.metric("💰 Current Price", f"₹{wk['close']:,.2f}")
+            p2.metric("📉 52W High Discount", f"{wk['disc_pct']}%", f"52W High: ₹{wk['high_52w']:,.0f}")
+            p3.metric("🧭 200 DMA Status", "Above 200 DMA" if wk["above_200dma"] else "Below 200 DMA", f"200 DMA: ₹{wk['ma_val']:,.0f}")
+            p4.metric("📅 Weekly HM Signal", wk["signal"].split("(")[0].strip(), f"RSI9: {wk['rsi9']} | WMA21: {wk['wma21']}")
+            if mo:
+                p5.metric("🗓️ Monthly HM Signal", mo["signal"].split("(")[0].strip(), f"RSI9: {mo['rsi9']} | WMA21: {mo['wma21']}")
+            else:
+                p5.metric("🗓️ Monthly HM Signal", "N/A (<2Y History)")
+
+            # Fundamental Health Metrics
+            st.write("**📊 Fundamental Quality Card:**")
+            f1, f2, f3, f4, f5 = st.columns(5)
+            f1.metric("🏢 Market Cap", f"₹{f['mcap_cr']:,.0f} Cr" if f["mcap_cr"] else "N/A")
+            f2.metric("⚖️ P/E Ratio", f"{f['pe']}" if f["pe"] is not None else "N/A")
+            f3.metric("🏆 ROE %", f"{f['roe']}%" if f["roe"] is not None else "N/A")
+            f4.metric("📈 EPS / Rev Growth", f"{f['eps_g']}%" if f["eps_g"] is not None else "N/A")
+            f5.metric("🏦 Debt / Equity", f"{f['dte']}" if f["dte"] is not None else "N/A")
+
+            # Actionable Summary Box
+            wk_bull = "BOTTOM" in wk["signal"] or "UPTREND" in wk["signal"]
+            mo_bull = (mo is not None) and ("BOTTOM" in mo["signal"] or "UPTREND" in mo["signal"])
+            if wk_bull and mo_bull and wk["above_200dma"]:
+                st.success(f"✅ **Investment Verdict ({report['symbol']}):** Weekly आणि Monthly दोन्ही चार्टवर मजबूत तेजी (`Above 200 DMA`) आहे. कॅटेगरी: **{report['bucket']}** — लाँग-टर्म SIP / टप्प्याटप्प्याने खरेदीसाठी चांगली स्थिती.")
+            elif wk_bull and wk["disc_pct"] >= 12.0:
+                st.info(f"🟢 **Buy-on-Dip Zone ({report['symbol']}):** स्टॉक ५२-आठवड्यांच्या उच्चांकापासून **{wk['disc_pct']}% डिस्काउंटवर** असून Weekly HM वर सुधारणा दिसत आहे. फंडामेंटल्स (`ROE`, `EPS Growth`) तपासून २–३ टप्प्यांत खरेदीचा विचार करता येईल.")
+            elif "TOP" in wk["signal"] or (mo and "TOP" in mo["signal"]):
+                st.warning(f"🟠 **Caution / Rebalance ({report['symbol']}):** HM इंडिकेटरवर Top Warning दिसत आहे. सध्या नवीन एकरकमी खरेदी टाळा.")
+            else:
+                st.error(f"🔴 **Wait / Avoid New Buy ({report['symbol']}):** स्टॉक सध्या कमजोर झोनमध्ये (`RSI 9 < WMA 21` किंवा `Below 200 DMA`) आहे. बॉटम तयार होण्याची वाट पहा.")
+
+            # 5-Year Price vs 200 DMA Chart
+            if not report["chart_df"].empty:
+                st.write(f"**📈 {report['symbol']} — 5-Year Weekly Price vs 200 DMA Trend:**")
+                st.line_chart(report["chart_df"])
+
+# ==============================================================================
+# TAB 3: 3Y–5Y INVESTMENT BACKTESTER
+# ==============================================================================
 with tab_bt:
     st.subheader("📊 3Y–5Y Investment Backtester (Hilega-Milega vs Buy & Hold)")
     st.caption("Long-Only: Weekly किंवा Monthly चार्टवर HM क्रॉसओव्हरवर खरेदी आणि Top क्रॉसवर (RSI9 < WMA21) बाहेर पडून कॅश सुरक्षित ठेवते.")
